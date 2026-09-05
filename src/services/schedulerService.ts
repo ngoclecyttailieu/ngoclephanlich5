@@ -1,0 +1,653 @@
+import { AppDatabase, ClassSubjectQuota, PeriodDetail, ScheduleConflict, SessionSchedule, StudentClass, Subject, Teacher } from '../types';
+
+export interface CalculatedQuota {
+  classId: string;
+  className: string;
+  cohortName: string;
+  subjectId: string;
+  subjectCode: string;
+  subjectName: string;
+  shortName: string;
+  colorBg: string;
+  colorText: string;
+  // Lý thuyết
+  initialTheory: number;
+  usedTheory: number;
+  remainingTheory: number;
+  isTheoryFinished: boolean;
+  // Thực hành (mỗi tổ của lớp phải học đủ initialPractice tiết)
+  initialPractice: number; // Số tiết TH chuẩn mỗi tổ phải học (e.g. 15 tiết)
+  usedPractice: number; // Tổng số tiết TH đã dạy cho lớp (các tổ cộng lại)
+  usedPracticeGroup1: number; // Số tiết Tổ 1 đã học
+  usedPracticeGroup2: number; // Số tiết Tổ 2 đã học
+  remainingPracticeGroup1: number; // Số tiết Tổ 1 còn thiếu
+  remainingPracticeGroup2: number; // Số tiết Tổ 2 còn thiếu
+  remainingPractice: number;
+  isPracticeFinished: boolean;
+  // Lâm sàng
+  initialClinical: number;
+  usedClinical: number;
+  remainingClinical: number;
+  isClinicalFinished: boolean;
+  // Tổng thể
+  totalInitial: number;
+  totalUsed: number;
+  totalRemaining: number;
+  percentageCompleted: number;
+  isFullyFinished: boolean;
+  // Overrides
+  hasOverride: boolean;
+}
+
+/**
+ * Calculates current period usage and remaining quotas for all class-subject combinations.
+ * Practice (TH) rule: Each sub-group (Tổ 1, Tổ 2) of a class must complete the full allocated practice periods.
+ */
+export function calculateAllQuotas(db: AppDatabase): CalculatedQuota[] {
+  const result: CalculatedQuota[] = [];
+
+  // Map to index classes and cohorts
+  const classMap = new Map<string, StudentClass>();
+  db.classes.forEach(c => classMap.set(c.id, c));
+
+  const cohortMap = new Map<string, string>();
+  db.cohorts.forEach(ch => cohortMap.set(ch.id, ch.name));
+
+  const subjectMap = new Map<string, Subject>();
+  db.subjects.forEach(s => subjectMap.set(s.id, s));
+
+  // Map to accumulate used periods: `${classId}_${subjectId}` => { lt, th_total, th_g1, th_g2, th_half_count, ls }
+  const usageMap = new Map<string, { lt: number; th: number; th_g1: number; th_g2: number; th_half: number; ls: number }>();
+
+  // Scan all schedules
+  db.schedules.forEach(sch => {
+    sch.periods.forEach(p => {
+      const key = `${sch.classId}_${p.subjectId}`;
+      const current = usageMap.get(key) || { lt: 0, th: 0, th_g1: 0, th_g2: 0, th_half: 0, ls: 0 };
+      if (p.periodType === 'LT') {
+        current.lt += p.periodsCount;
+      } else if (p.periodType === 'TH') {
+        current.th += p.periodsCount;
+        if (p.practiceType === 'group1') {
+          current.th_g1 += p.periodsCount;
+        } else if (p.practiceType === 'group2') {
+          current.th_g2 += p.periodsCount;
+        } else if (p.practiceType === 'full') {
+          current.th_g1 += p.periodsCount;
+          current.th_g2 += p.periodsCount;
+        } else {
+          // generic half: track count
+          current.th_half += p.periodsCount;
+        }
+      } else if (p.periodType === 'LS') {
+        current.ls += p.periodsCount;
+      }
+      usageMap.set(key, current);
+    });
+  });
+
+  // Map existing manual overrides
+  const quotaOverrideMap = new Map<string, ClassSubjectQuota>();
+  if (db.quotas) {
+    db.quotas.forEach(q => quotaOverrideMap.set(`${q.classId}_${q.subjectId}`, q));
+  }
+
+  // Iterate over all classes and subjects
+  db.classes.forEach(cls => {
+    const cohortName = cohortMap.get(cls.cohortId) || '';
+    
+    // Determine which subjects to track for this class
+    let subjectsToTrack: { subject: Subject; initialTheory: number; initialPractice: number; initialClinical: number }[] = [];
+    
+    if (cls.curriculumId && db.curriculums) {
+      const curriculum = db.curriculums.find(c => c.id === cls.curriculumId);
+      if (curriculum) {
+        curriculum.items.forEach(item => {
+          const sub = subjectMap.get(item.subjectId);
+          if (sub) {
+            subjectsToTrack.push({
+              subject: sub,
+              initialTheory: item.theoryPeriods,
+              initialPractice: item.practicePeriods,
+              initialClinical: item.clinicalPeriods,
+            });
+          }
+        });
+      }
+    }
+    
+    // Fallback if no curriculum or empty curriculum
+    // REMOVED: To enforce strict rule that classes can only be scheduled for subjects in their curriculum.
+    /*
+    if (subjectsToTrack.length === 0) {
+      db.subjects.forEach(sub => {
+        subjectsToTrack.push({
+          subject: sub,
+          initialTheory: sub.theoryPeriods,
+          initialPractice: sub.practicePeriods,
+          initialClinical: sub.clinicalPeriods,
+        });
+      });
+    }
+    */
+
+    subjectsToTrack.forEach(({ subject: sub, initialTheory, initialPractice, initialClinical }) => {
+      const key = `${cls.id}_${sub.id}`;
+      const usage = usageMap.get(key) || { lt: 0, th: 0, th_g1: 0, th_g2: 0, th_half: 0, ls: 0 };
+      const override = quotaOverrideMap.get(key);
+
+      const usedTheory = usage.lt;
+      const usedClinical = usage.ls;
+
+      // Calculate practice per group:
+      // If generic half sessions exist, intelligently attribute them to Tổ 1 first, then Tổ 2
+      let g1Used = usage.th_g1;
+      let g2Used = usage.th_g2;
+      if (usage.th_half > 0) {
+        // Distribute generic half periods to balance Tổ 1 and Tổ 2
+        let unassigned = usage.th_half;
+        while (unassigned > 0) {
+          const step = Math.min(unassigned, 4);
+          if (g1Used <= g2Used) {
+            g1Used += step;
+          } else {
+            g2Used += step;
+          }
+          unassigned -= step;
+        }
+      }
+
+      const usedPracticeGroup1 = g1Used;
+      const usedPracticeGroup2 = g2Used;
+      const usedPractice = usage.th; // total teaching hours scheduled
+
+      const remainingPracticeGroup1 = Math.max(0, initialPractice - usedPracticeGroup1);
+      const remainingPracticeGroup2 = Math.max(0, initialPractice - usedPracticeGroup2);
+
+      
+      const hasOverride = !!(
+        override?.overrideRemainingTheory !== undefined ||
+        override?.overrideRemainingPractice !== undefined ||
+        override?.overrideRemainingClinical !== undefined
+      );
+
+      const remainingTheory = override?.overrideRemainingTheory !== undefined
+        ? override.overrideRemainingTheory
+        : Math.max(0, initialTheory - usedTheory);
+        
+      const remainingPractice = override?.overrideRemainingPractice !== undefined
+        ? override.overrideRemainingPractice
+        : (remainingPracticeGroup1 + remainingPracticeGroup2);
+        
+      const remainingClinical = override?.overrideRemainingClinical !== undefined
+        ? override.overrideRemainingClinical
+        : Math.max(0, initialClinical - usedClinical);
+
+      const effectiveInitialTheory = usedTheory + remainingTheory;
+      // For practice, if not overriden, it's initialPractice. If overriden, it's used + remaining (combined)
+      const effectiveInitialPractice = override?.overrideRemainingPractice !== undefined 
+        ? usedPractice + remainingPractice 
+        : initialPractice;
+      const effectiveInitialClinical = usedClinical + remainingClinical;
+
+      // Total target across curriculum: Theory + (Practice per group * 2 if split into 2 groups, or Practice) + Clinical
+      const targetPracticeTotal = initialPractice * 2; // Total student group practice load
+      
+      const totalUsed = usedTheory + usedPractice + usedClinical;
+      const totalRemaining = remainingTheory + remainingPractice + remainingClinical;
+      
+      const effectiveTotalInitial = hasOverride ? (totalUsed + totalRemaining) : (initialTheory + (initialPractice > 0 ? targetPracticeTotal : 0) + initialClinical);
+
+      const percentageCompleted = effectiveTotalInitial > 0
+        ? Math.min(100, Math.round((totalUsed / effectiveTotalInitial) * 100))
+        : (totalRemaining === 0 ? 100 : 0);
+
+      const isTheoryFinished = remainingTheory <= 0;
+      const isPracticeFinished = override?.overrideRemainingPractice !== undefined 
+        ? remainingPractice <= 0 
+        : (remainingPracticeGroup1 <= 0 && remainingPracticeGroup2 <= 0);
+      const isClinicalFinished = remainingClinical <= 0;
+
+      const isFullyFinished = (initialTheory === 0 ? isTheoryFinished : remainingTheory <= 0) &&
+                              (initialPractice === 0 ? isPracticeFinished : isPracticeFinished) &&
+                              (initialClinical === 0 ? isClinicalFinished : remainingClinical <= 0);
+
+      result.push({
+        isTheoryFinished,
+        isPracticeFinished,
+        isClinicalFinished,
+        classId: cls.id,
+        className: cls.name,
+        cohortName,
+        subjectId: sub.id,
+        subjectCode: sub.code,
+        subjectName: sub.name,
+        shortName: sub.shortName || sub.name,
+        colorBg: sub.colorBg,
+        colorText: sub.colorText,
+        initialTheory: effectiveInitialTheory,
+        initialPractice: effectiveInitialPractice,
+        initialClinical: effectiveInitialClinical,
+        usedTheory,
+        usedPractice,
+        usedPracticeGroup1,
+        usedPracticeGroup2,
+        usedClinical,
+        totalUsed,
+        totalInitial: effectiveTotalInitial,
+        remainingTheory,
+        remainingPractice,
+        remainingPracticeGroup1,
+        remainingPracticeGroup2,
+        remainingClinical,
+        totalRemaining,
+        percentageCompleted,
+        isFullyFinished,
+        hasOverride,
+      });
+    });
+  });
+
+  return result;
+}
+
+/**
+ * Detect conflicts in current week (or across all weeks)
+ */
+export function detectConflicts(db: AppDatabase, targetWeek?: number): ScheduleConflict[] {
+  const conflicts: ScheduleConflict[] = [];
+  const targetSchedules = targetWeek !== undefined
+    ? db.schedules.filter(s => s.weekNumber === targetWeek)
+    : db.schedules;
+
+  const teacherMap = new Map<string, Teacher>();
+  db.teachers.forEach(t => teacherMap.set(t.id, t));
+
+  const classMap = new Map<string, StudentClass>();
+  db.classes.forEach(c => classMap.set(c.id, c));
+
+  const subjectMap = new Map<string, Subject>();
+  db.subjects.forEach(s => subjectMap.set(s.id, s));
+
+  // 1. Group schedules by (weekNumber, dayOfWeek, session)
+  const timeSlotMap = new Map<string, SessionSchedule[]>();
+  targetSchedules.forEach(sch => {
+    const slotKey = `${sch.weekNumber}_${sch.dayOfWeek}_${sch.session}`;
+    const list = timeSlotMap.get(slotKey) || [];
+    list.push(sch);
+    timeSlotMap.set(slotKey, list);
+  });
+
+  timeSlotMap.forEach((schedulesInSlot, slotKey) => {
+    const [wStr, dStr, sessionStr] = slotKey.split('_');
+    const weekNum = parseInt(wStr, 10);
+    const dayOfWeek = parseInt(dStr, 10);
+    const session = sessionStr as 'morning' | 'afternoon';
+    const dayLabel = `Thứ ${dayOfWeek === 8 ? 'CN' : dayOfWeek}`;
+    const sessionLabel = session === 'morning' ? 'Sáng' : 'Chiều';
+
+    // Check Class period overload (> 4 periods per session)
+    schedulesInSlot.forEach(sch => {
+      const totalPeriods = sch.periods.reduce((sum, p) => sum + p.periodsCount, 0);
+      if (totalPeriods > 4) {
+        const cls = classMap.get(sch.classId);
+        conflicts.push({
+          id: `overload_${sch.id}`,
+          type: 'CLASS_OVERLOAD',
+          severity: 'error',
+          message: `Lớp ${cls?.name || sch.classId} vượt quá 4 tiết trong buổi (${totalPeriods} tiết) vào ${dayLabel} ${sessionLabel} - Tuần ${weekNum}`,
+          weekNumber: weekNum,
+          dayOfWeek,
+          session,
+          details: {
+            classIds: [sch.classId],
+            classNames: [cls?.name || sch.classId],
+            totalPeriods,
+          }
+        });
+      }
+    });
+
+    // Check Teacher conflict: Same teacher teaching 2 different classes in the same slot (Exclude intentional combined classes)
+    const teacherUsage = new Map<string, Array<{ classId: string; className: string; combinedGroupId?: string; subjectId: string }>>();
+    schedulesInSlot.forEach(sch => {
+      const cls = classMap.get(sch.classId);
+      const clsName = cls?.name || sch.classId;
+
+      sch.periods.forEach(p => {
+        p.teacherIds.forEach(tId => {
+          if (!tId) return;
+          const entry = teacherUsage.get(tId) || [];
+          if (!entry.some(e => e.classId === sch.classId)) {
+            entry.push({
+              classId: sch.classId,
+              className: clsName,
+              combinedGroupId: sch.combinedGroupId,
+              subjectId: p.subjectId,
+            });
+          }
+          teacherUsage.set(tId, entry);
+        });
+      });
+    });
+
+    teacherUsage.forEach((items, tId) => {
+      if (items.length > 1) {
+        // Check if ALL these classes belong to the same combined group or same subject
+        const firstGroup = items[0].combinedGroupId;
+        const isAllCombined = firstGroup && items.every(i => i.combinedGroupId === firstGroup);
+
+        if (!isAllCombined) {
+          const t = teacherMap.get(tId);
+          conflicts.push({
+            id: `t_conflict_${weekNum}_${dayOfWeek}_${session}_${tId}`,
+            type: 'TEACHER_CONFLICT',
+            severity: 'error',
+            message: `Trùng lịch: Giảng viên ${t?.name || tId} được xếp dạy đồng thời ${items.map(i => i.className).join(' và ')} vào ${dayLabel} ${sessionLabel} - Tuần ${weekNum}`,
+            weekNumber: weekNum,
+            dayOfWeek,
+            session,
+            details: {
+              teacherId: tId,
+              teacherName: t?.name || tId,
+              classIds: items.map(i => i.classId),
+              classNames: items.map(i => i.className),
+            }
+          });
+        }
+      }
+    });
+
+    // Check Lecture Hall / Classroom conflict: Same physical lecture hall used by 2 different classes (Exclude intentional combined classes)
+    const roomUsage = new Map<string, Array<{ classId: string; className: string; combinedGroupId?: string; subjectId: string }>>();
+    schedulesInSlot.forEach(sch => {
+      const cls = classMap.get(sch.classId);
+      const clsName = cls?.name || sch.classId;
+      sch.periods.forEach(p => {
+        if (p.periodType === 'LT') {
+          const r = cleanLectureHallCode(p.roomOrHospital);
+          if (r && !r.toLowerCase().includes('bệnh viện') && !r.toLowerCase().includes('bv')) {
+            const entry = roomUsage.get(r) || [];
+            if (!entry.some(e => e.classId === sch.classId)) {
+              entry.push({
+                classId: sch.classId,
+                className: clsName,
+                combinedGroupId: sch.combinedGroupId,
+                subjectId: p.subjectId,
+              });
+            }
+            roomUsage.set(r, entry);
+          }
+        }
+      });
+    });
+
+    roomUsage.forEach((items, room) => {
+      if (items.length > 1) {
+        // Check if all classes are intentional combined class
+        const firstGroup = items[0].combinedGroupId;
+        const isAllCombined = firstGroup && items.every(i => i.combinedGroupId === firstGroup);
+
+        if (!isAllCombined) {
+          conflicts.push({
+            id: `hall_conflict_${weekNum}_${dayOfWeek}_${session}_${room}`,
+            type: 'LECTURE_HALL_CONFLICT',
+            severity: 'error',
+            message: `Trùng Giảng đường ${room}: Được xếp cho ${items.map(i => i.className).join(' & ')} cùng học vào ${dayLabel} ${sessionLabel} - Tuần ${weekNum}`,
+            weekNumber: weekNum,
+            dayOfWeek,
+            session,
+            details: {
+              room,
+              classIds: items.map(i => i.classId),
+              classNames: items.map(i => i.className),
+            }
+          });
+        }
+      }
+    });
+
+    // Check Department Practice Room Overload (TH): When concurrent TH classes exceed department capacity
+    const deptUsage = new Map<string, { classIds: string[]; classNames: string[]; subjectNames: string[] }>();
+    schedulesInSlot.forEach(sch => {
+      const cls = classMap.get(sch.classId);
+      const clsName = cls?.name || sch.classId;
+      sch.periods.forEach(p => {
+        if (p.periodType === 'TH') {
+          const sub = subjectMap.get(p.subjectId);
+          const deptId = sub?.departmentId;
+          if (deptId) {
+            const entry = deptUsage.get(deptId) || { classIds: [], classNames: [], subjectNames: [] };
+            if (!entry.classIds.includes(sch.classId)) {
+              entry.classIds.push(sch.classId);
+              entry.classNames.push(clsName);
+              if (sub?.name && !entry.subjectNames.includes(sub.name)) {
+                entry.subjectNames.push(sub.name);
+              }
+            }
+            deptUsage.set(deptId, entry);
+          }
+        }
+      });
+    });
+
+    deptUsage.forEach((data, deptId) => {
+      const dept = (db.departments || []).find(d => d.id === deptId);
+      if (dept && data.classIds.length > dept.practiceRoomCount) {
+        conflicts.push({
+          id: `dept_overload_${weekNum}_${dayOfWeek}_${session}_${deptId}`,
+          type: 'PRACTICE_ROOM_OVERLOAD',
+          severity: 'error',
+          message: `Quá tải phòng thực hành ${dept.name}: Đang có ${data.classIds.length} lớp học thực hành (${data.classNames.join(', ')}) trong khi Bộ môn chỉ có ${dept.practiceRoomCount} phòng vào ${dayLabel} ${sessionLabel} - Tuần ${weekNum}`,
+          weekNumber: weekNum,
+          dayOfWeek,
+          session,
+          details: {
+            departmentId: deptId,
+            departmentName: dept.name,
+            practiceLimit: dept.practiceRoomCount,
+            practiceCurrent: data.classIds.length,
+            classIds: data.classIds,
+            classNames: data.classNames,
+          }
+        });
+      }
+    });
+  });
+
+  return conflicts;
+}
+
+/**
+ * Helper to clean room/hall string to show just the number/code (e.g. 101, 201, B6P1)
+ */
+export function cleanLectureHallCode(roomStr?: string): string {
+  if (!roomStr) return '';
+  const trimmed = roomStr.trim();
+  if (!trimmed) return '';
+  if (trimmed.toLowerCase().includes('bệnh viện') || trimmed.toLowerCase().includes('bv')) {
+    return trimmed;
+  }
+  if (trimmed.toLowerCase() === 'phòng tm' || trimmed.toLowerCase() === 'phong tm' || trimmed.toLowerCase() === 'tm' || trimmed.toLowerCase() === 'gđ tm') {
+    return 'Phòng TM';
+  }
+  const cleaned = trimmed
+    .replace(/^giảng\s+đường\s+/i, '')
+    .replace(/^giang\s+duong\s+/i, '')
+    .replace(/^phòng\s+học\s+/i, '')
+    .replace(/^phong\s+hoc\s+/i, '')
+    .replace(/^phòng\s+/i, '')
+    .replace(/^phong\s+/i, '')
+    .replace(/^p\.\s*/i, '')
+    .replace(/^p\s+/i, '')
+    .replace(/^gđ\s*/i, '')
+    .trim();
+  return cleaned || trimmed;
+}
+
+/**
+ * Standard formatting of subject name based on period type and practice type:
+ * - Lâm sàng (LS): "LS <tên viết tắt môn học>" (e.g. "LS Nội", "LS Ngoại", "LS Sản", "LS Nhi")
+ * - Thực hành (TH): "TT <tên viết tắt môn học> 1/2" (hoặc "TT <tên viết tắt môn học> Tổ 1/2" hoặc "TT <tên viết tắt môn học>")
+ * - Lý thuyết (LT): "<tên viết tắt môn học>" (hoặc tên môn học)
+ */
+export function formatSubjectDisplayName(
+  subjectOrName: Subject | string | undefined,
+  periodType: 'LT' | 'TH' | 'LS',
+  practiceType?: 'full' | 'half' | 'group1' | 'group2'
+): string {
+  if (!subjectOrName) return 'Môn học';
+  const name = typeof subjectOrName === 'string'
+    ? subjectOrName
+    : (subjectOrName.shortName || subjectOrName.name || 'Môn học');
+
+  if (periodType === 'LS') {
+    return `LS ${name}`;
+  }
+  if (periodType === 'TH') {
+    if (practiceType === 'group1') return `TT ${name} Tổ 1`;
+    if (practiceType === 'group2') return `TT ${name} Tổ 2`;
+    if (practiceType === 'half') return `TT ${name} 1/2`;
+    return `TT ${name}`;
+  }
+  return name;
+}
+
+/**
+ * Clone schedules from sourceWeek to targetWeeks
+ */
+export function cloneWeekSchedule(
+  db: AppDatabase,
+  sourceWeek: number,
+  targetWeeks: number[],
+  overrideExisting: boolean = true
+): SessionSchedule[] {
+  const sourceSchedules = db.schedules.filter(s => s.weekNumber === sourceWeek);
+  if (sourceSchedules.length === 0) return db.schedules;
+
+  let newSchedules = [...db.schedules];
+
+  targetWeeks.forEach(targetWeek => {
+    if (targetWeek === sourceWeek) return;
+
+    if (overrideExisting) {
+      newSchedules = newSchedules.filter(s => s.weekNumber !== targetWeek);
+    }
+
+    sourceSchedules.forEach(src => {
+      newSchedules.push({
+        ...src,
+        id: `sch_w${targetWeek}_${Math.random().toString(36).substring(2, 9)}`,
+        weekNumber: targetWeek,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  });
+
+  return newSchedules;
+}
+
+/**
+ * Smart Auto-generate schedule for a week based on remaining quota and teaching assignments
+ */
+export function autoGenerateWeekSchedule(
+  db: AppDatabase,
+  targetWeek: number,
+  cohortId?: string
+): SessionSchedule[] {
+  const targetClasses = cohortId
+    ? db.classes.filter(c => c.cohortId === cohortId)
+    : db.classes;
+
+  const quotas = calculateAllQuotas(db);
+  const quotaMap = new Map<string, CalculatedQuota>();
+  quotas.forEach(q => quotaMap.set(`${q.classId}_${q.subjectId}`, q));
+
+  // Map assignments
+  const assignmentMap = new Map<string, { lt: string[]; th: string[]; ls: string[] }>();
+  db.assignments.forEach(a => {
+    assignmentMap.set(`${a.classId}_${a.subjectId}`, {
+      lt: a.theoryTeacherIds,
+      th: a.practiceTeacherIds,
+      ls: a.clinicalTeacherIds,
+    });
+  });
+
+  const newSchedules: SessionSchedule[] = db.schedules.filter(s => s.weekNumber !== targetWeek);
+  const busyTeachers = new Map<string, Set<string>>(); // slotKey -> Set<teacherId>
+
+  const days = [2, 3, 4, 5, 6]; // Thứ 2 -> Thứ 6
+  const sessions: Array<'morning' | 'afternoon'> = ['morning', 'afternoon'];
+
+  targetClasses.forEach(cls => {
+    // find available subjects with remaining quota
+    const candidateQuotas = quotas.filter(q => q.classId === cls.id && q.totalRemaining > 0);
+    if (candidateQuotas.length === 0) return;
+
+    let subIndex = 0;
+
+    days.forEach(day => {
+      sessions.forEach(session => {
+        if (subIndex >= candidateQuotas.length) return;
+
+        const currentQuota = candidateQuotas[subIndex];
+        const asg = assignmentMap.get(`${cls.id}_${currentQuota.subjectId}`);
+
+        // decide period type
+        let chosenType: 'LT' | 'TH' | 'LS' = 'LT';
+        let chosenTeachers: string[] = [];
+        let periods = 4;
+
+        if (currentQuota.remainingTheory >= 2) {
+          chosenType = 'LT';
+          chosenTeachers = asg?.lt || [];
+          periods = Math.min(4, currentQuota.remainingTheory >= 4 ? 4 : 2);
+        } else if (currentQuota.remainingPractice >= 4) {
+          chosenType = 'TH';
+          chosenTeachers = asg?.th || [];
+          periods = 4;
+        } else if (currentQuota.remainingClinical >= 4) {
+          chosenType = 'LS';
+          chosenTeachers = asg?.ls || [];
+          periods = 4;
+        }
+
+        const slotKey = `${targetWeek}_${day}_${session}`;
+        const slotBusy = busyTeachers.get(slotKey) || new Set<string>();
+
+        // check if teacher is free
+        const isFree = chosenTeachers.every(tId => !slotBusy.has(tId));
+        if (isFree && chosenTeachers.length > 0) {
+          chosenTeachers.forEach(tId => slotBusy.add(tId));
+          busyTeachers.set(slotKey, slotBusy);
+
+          newSchedules.push({
+            id: `auto_${targetWeek}_${cls.id}_${day}_${session}_${Math.random().toString(36).substring(2, 7)}`,
+            weekNumber: targetWeek,
+            academicYear: db.academicYear,
+            classId: cls.id,
+            dayOfWeek: day,
+            session,
+            periods: [
+              {
+                subjectId: currentQuota.subjectId,
+                periodType: chosenType,
+                practiceType: chosenType === 'TH' ? 'half' : 'full',
+                periodsCount: periods,
+                teacherIds: chosenTeachers,
+                roomOrHospital: chosenType === 'LS' ? 'BV Đa khoa Tỉnh Thanh Hóa' : 'P.201 Giảng đường',
+                lessonTitle: `Bài học theo tiến độ ${chosenType}`,
+              }
+            ],
+            updatedAt: new Date().toISOString(),
+          });
+
+          // advance subIndex if we finished
+          subIndex++;
+        }
+      });
+    });
+  });
+
+  return newSchedules;
+}

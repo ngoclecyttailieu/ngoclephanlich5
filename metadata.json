@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Quản lý Phân tiết \u0026 Thời khóa biểu - CĐ Y Tế Thanh Hóa",
+  "description": "Hệ thống quản lý phân tiết giảng dạy, xếp thời khóa biểu thông minh, tự động trừ lùi quỹ tiết, kiểm tra xung đột và xuất nhập Excel đa khối chuyên nghiệp cho Trường Cao đẳng Y tế Thanh Hóa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
